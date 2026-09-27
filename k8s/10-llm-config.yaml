@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-config
+  namespace: llm-ring
+data:
+  MODEL_URL: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+  MODEL_FILE: "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+  LLAMA_ARG_MODEL: "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+  LLAMA_ARG_HOST: "0.0.0.0"
+  LLAMA_ARG_PORT: "8080"
+  LLAMA_ARG_CTX_SIZE: "8192"
+  LLAMA_ARG_N_PARALLEL: "4"
+  LLAMA_ARG_THREADS: "2"
+  LLAMA_ARG_ENDPOINTS_METRICS: "1"

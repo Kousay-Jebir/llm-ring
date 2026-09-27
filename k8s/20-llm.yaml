@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm
+  namespace: llm-ring
+spec:
+  clusterIP: None
+  selector: { app: llm }
+  ports:
+    - { name: http, port: 8080 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llm
+  namespace: llm-ring
+spec:
+  serviceName: llm
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector: { matchLabels: { app: llm } }
+  template:
+    metadata:
+      labels: { app: llm }
+    spec:
+      nodeSelector: { pool: llm }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector: { matchLabels: { app: llm } }
+      initContainers:
+        - name: fetch-model
+          image: curlimages/curl:8.10.1
+          envFrom: [{ configMapRef: { name: llm-config } }]
+          command: ["sh", "-c"]
+          args:
+            - |
+              if [ -f "/models/$MODEL_FILE" ]; then
+                echo "model already present, skipping download"
+              else
+                echo "downloading model..."
+                curl -fL -o "/models/$MODEL_FILE.part" "$MODEL_URL" &&
+                mv "/models/$MODEL_FILE.part" "/models/$MODEL_FILE"
+              fi
+          volumeMounts:
+            - { name: models, mountPath: /models }
+      containers:
+        - name: llama
+          image: ghcr.io/ggml-org/llama.cpp:server
+          envFrom: [{ configMapRef: { name: llm-config } }]
+          ports:
+            - { name: http, containerPort: 8080 }
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests: { cpu: "1", memory: "1Gi" }
+            limits: { memory: "2Gi" }
+          volumeMounts:
+            - { name: models, mountPath: /models, readOnly: true }
+  volumeClaimTemplates:
+    - metadata: { name: models }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 2Gi } }

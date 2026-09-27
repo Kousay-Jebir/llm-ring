@@ -1,0 +1,11 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: llm-ring
+nodes:
+  - role: control-plane
+  - role: worker
+    labels: { pool: llm }
+  - role: worker
+    labels: { pool: llm }
+  - role: worker
+    labels: { pool: llm }
