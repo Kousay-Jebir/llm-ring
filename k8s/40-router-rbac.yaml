@@ -1,0 +1,31 @@
+# The router discovers ready replicas by reading the EndpointSlices of the
+# headless Service. It gets exactly that permission, in this namespace only.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: router
+  namespace: llm-ring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: router-endpointslice-reader
+  namespace: llm-ring
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: router-endpointslice-reader
+  namespace: llm-ring
+subjects:
+  - kind: ServiceAccount
+    name: router
+    namespace: llm-ring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: router-endpointslice-reader
