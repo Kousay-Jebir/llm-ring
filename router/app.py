@@ -71,7 +71,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         upstream = httpx.AsyncClient(
             timeout=httpx.Timeout(settings.upstream_timeout_s, connect=5.0),
-            limits=httpx.Limits(max_connections=256, max_keepalive_connections=64),
+            limits=httpx.Limits(max_connections=1024, max_keepalive_connections=512),
         )
 
         async def send(url: str, body: bytes, headers: Any) -> tuple[int, bytes]:
