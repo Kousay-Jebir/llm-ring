@@ -49,6 +49,9 @@ spec:
         - name: llama
           image: ghcr.io/ggml-org/llama.cpp:server
           envFrom: [{ configMapRef: { name: llm-config } }]
+          env:
+            # Built from MODEL_FILE (set in the ConfigMap), so the file name is written once.
+            - { name: LLAMA_ARG_MODEL, value: "/models/$(MODEL_FILE)" }
           ports:
             - { name: http, containerPort: 8080 }
           startupProbe:

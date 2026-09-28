@@ -1,3 +1,5 @@
+# Every llama.cpp replica setting lives here. After a change:
+# kubectl apply -f k8s/10-llm-config.yaml; kubectl rollout restart statefulset/llm
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -5,12 +7,11 @@ metadata:
   namespace: llm-ring
 data:
   MODEL_URL: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-  MODEL_FILE: "qwen2.5-0.5b-instruct-q4_k_m.gguf"
-  LLAMA_ARG_MODEL: "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+  MODEL_FILE: "qwen2.5-0.5b-instruct-q4_k_m.gguf"   # the server loads /models/<MODEL_FILE>
   LLAMA_ARG_HOST: "0.0.0.0"
-  LLAMA_ARG_PORT: "8080"
-  LLAMA_ARG_CTX_SIZE: "16384"
-  LLAMA_ARG_N_PARALLEL: "4"
+  LLAMA_ARG_PORT: "8080"             # must match containerPort in 20-llm.yaml
+  LLAMA_ARG_CTX_SIZE: "16384"        # shared by the slots: 4096 tokens per slot
+  LLAMA_ARG_N_PARALLEL: "4"          # slots: requests processed at once per replica
   LLAMA_ARG_THREADS: "2"
   LLAMA_ARG_ENDPOINT_METRICS: "1"
-  LLAMA_ARG_CACHE_RAM: "512"
+  LLAMA_ARG_CACHE_RAM: "512"         # MiB of RAM prompt cache; keep model + KV + this < 2Gi

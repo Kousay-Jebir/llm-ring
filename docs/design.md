@@ -32,7 +32,7 @@ where the cache already is.
 
 **Stable hashing.** Python's built-in `hash()` is salted per process, so a
 restarted router would reshuffle every conversation. The router uses BLAKE2b
-(`router/hashing.py`).
+(`stable_hash` in `router/ring.py`).
 
 **Virtual nodes.** Each replica is placed at 100 points on the ring, so three
 replicas split it evenly instead of by chance.
@@ -49,6 +49,9 @@ routed.
 The original algorithm assumes requests and cache misses cost about the same. For
 LLMs neither holds. Each addition can be switched off through the admin API, for
 ablation experiments (`token_load`, `long_stickiness`, `placement_memory`).
+
+All policies live in `router/policies.py`; each declares the settings it accepts
+(`params`), and the registry (`build_policy`) rejects overrides a policy doesn't accept.
 
 ### 3.1 Cache-aware token load
 
@@ -107,12 +110,12 @@ Steps 4 and 5 run with no `await` in between. The router is a single asyncio eve
 loop that only switches between requests at `await` points, so every routing
 decision sees the load of all requests routed before it.
 
-**Load tracker** (`router/load.py`). Counts in-flight requests and in-flight
+**Load tracker** (`LoadTracker` in `router/core.py`). Counts in-flight requests and in-flight
 estimated tokens per replica. `bounded` reads request counts, `llm-aware` reads
 tokens. A replica removed while it still has requests in flight keeps its counters
 until they are released, then is cleaned up.
 
-**Discovery** (`router/discovery.py`, `router/app.py`). Every 2 seconds the router
+**Discovery** (`router/app.py`). Every `ROUTER_DISCOVERY_INTERVAL_S` seconds (2) the router
 reads the EndpointSlices of the `llm` headless Service through the Kubernetes API,
 authenticating with its ServiceAccount token, which is re-read on each call because
 Kubernetes rotates it. Only ready, non-terminating endpoints count. On errors, the
@@ -122,7 +125,52 @@ last known replicas are kept.
 counters. `PUT /admin/policy` swaps the policy; unknown parameters are rejected
 rather than silently ignored.
 
-## 5. Current limitations
+## 5. What gets measured, and how it flows
+
+One request, from the traffic generator to the analysis:
+
+```
+generator --(headers: x-conversation-id, x-turn)--> router --> replica (llama.cpp)
+generator <--(headers: x-routed-to, x-route-reason; body: answer + "timings")-- router
+generator writes one CSV row  -->  run.py adds one JSON per run  -->  analyze.py
+```
+
+The names that cross between the parts are defined once, at the top of
+`router/core.py` (`CONVERSATION_HEADER`, `REPLICA_HEADER`, `TIMINGS`, ...), and the
+generator imports them.
+
+**Per request** (one CSV row, written by `traffic/generator.py`):
+
+| Column | Produced by | Meaning |
+|---|---|---|
+| `run_id`, `policy`, `conversation_id`, `heavy`, `turn` | generator | which request this is |
+| `est_prompt_tokens` | generator, router's rule | estimated size of the conversation sent |
+| `t_start_s`, `t_end_s`, `latency_ms` | generator | when it was sent and answered, and how long it took |
+| `status`, `error` | generator | HTTP status; for failures, what went wrong |
+| `replica`, `route_reason` | router, response headers | where it was routed and why |
+| `cache_n`, `prompt_n` | replica, `timings` | prompt tokens reused from cache / processed |
+| `prompt_ms`, `predicted_n`, `predicted_ms` | replica, `timings` | processing time, tokens generated, generation time |
+
+**Per run** (one JSON, written by `experiments/run.py`): what was run (policy,
+parameters, seed, profile), when the new replica was requested and when the router
+first saw it (`new_replica_ready_s`), request and error counts, and the router's
+state at the end.
+
+**Per policy** (`experiments/analyze.py`, from the two files above):
+
+| Metric | Computed from |
+|---|---|
+| `hit_rate` | `cache_n / (cache_n + prompt_n)`, summed over follow-up turns |
+| `hit_rate_after` | same, for follow-ups starting within `window_s` after `new_replica_ready_s` |
+| `moved_after_scale` | conversations whose consecutive turns straddle `new_replica_ready_s`: share with a different `replica` |
+| `p50/p95_latency_ms`, `p95_prompt_ms` | `latency_ms`, `prompt_ms` of successful requests |
+| `imbalance` | work per replica (`prompt_n + predicted_n`) before the scale-up: max / mean |
+
+The router also logs every request as a JSON line (`kubectl logs deploy/router`)
+with the same routing and timing fields, for debugging; the analysis doesn't use
+these logs.
+
+## 6. Current limitations
 
 - **One laptop.** All kind nodes share the same CPU: scaling to 4 replicas adds a
   cache and a routing target, not real compute. Absolute latencies are pessimistic.

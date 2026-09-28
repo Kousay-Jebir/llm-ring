@@ -1,0 +1,29 @@
+router_url = "http://localhost:8000"   # where the router is reachable (port-forward)
+seed = 42
+
+[generator]
+profile = "traffic/profiles/quick.json"  # used by `python -m traffic.generator`
+connect_timeout_s = 10
+max_connections = 200                    # enough for every conversation to have a request in flight
+
+[experiment]
+profile = "traffic/profiles/standard.json"
+policies = ["round-robin", "mod-n", "consistent", "bounded", "llm-aware"]
+repeats = 1
+scale_at_s = 90              # when to add a replica, in seconds after start; 0 disables it
+base_replicas = 3
+scale_to = 4
+cooldown_s = 10              # pause between runs
+namespace = "llm-ring"
+statefulset = "llm"
+out_dir = "experiments/results/raw"
+replica_wait_timeout_s = 900  # max wait for replicas to be ready between runs
+replica_poll_s = 2
+scale_poll_s = 1              # how precisely the new replica's arrival is timed
+admin_timeout_s = 10          # router /admin calls
+
+[analysis]
+results_dir = "experiments/results/raw"
+out_dir = "experiments/results"
+window_s = 60                 # "right after the scale-up" = this many seconds
+bin_s = 15                    # chart time bins; use 2-3 for short runs

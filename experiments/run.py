@@ -1,8 +1,17 @@
-"""Run the main experiment.
+"""Run the experiment: for each policy, reset to the base replica count, switch the router's
+policy, replay the same traffic, and add a replica mid-run. Each run writes <run_id>.csv
+(one row per request) and <run_id>.json (metadata). Defaults come from settings.toml.
 
-For each policy: reset to 3 replicas, switch the router's policy, replay the same
-traffic, and scale the StatefulSet to 4 replicas in the middle of the run. Each run
-produces ``<run_id>.csv`` (one row per request) and ``<run_id>.json`` (metadata).
+Needs the router reachable at router_url, e.g. `kubectl port-forward svc/router 8000:80`.
+Policy specs can carry parameters: `llm-aware:token_load=false`, `bounded:epsilon=0.5`.
+
+<run_id>.json fields:
+  run_id, policy (spec as given), policy_name, policy_params, repeat, seed, profile,
+  base_replicas, scale_to, scale_at_s, started_at      what was run
+  scale_command_s       when `kubectl scale` was sent (seconds since start)
+  new_replica_ready_s   when the router first saw the new replica; analysis uses it
+  scale_skipped         set instead of the two above if traffic ended first
+  duration_s, requests, errors, router_state_at_end   how it went
 """
 
 from __future__ import annotations
@@ -19,154 +28,105 @@ from typing import Any
 
 import httpx
 
-from traffic.generator import Profile
+from traffic.generator import SETTINGS, Profile
 from traffic.generator import run as run_traffic
 
-DEFAULT_POLICIES = ["consistent", "mod-n"]#, "consistent", "bounded", "llm-aware"]
+EXP = SETTINGS["experiment"]
 
 
 def parse_policy_spec(spec: str) -> tuple[str, dict[str, Any]]:
+    """'llm-aware:token_load=false,epsilon=0.5' -> ('llm-aware', {'token_load': False, 'epsilon': 0.5})"""
     name, _, raw = spec.partition(":")
     params: dict[str, Any] = {}
     for item in filter(None, raw.split(",")):
         key, sep, value = item.partition("=")
         if not sep:
             raise ValueError(f"bad parameter {item!r} in {spec!r}; expected key=value")
-        lowered = value.lower()
-        if lowered in ("true", "false"):
-            params[key] = lowered == "true"
+        if value.lower() in ("true", "false"):
+            params[key] = value.lower() == "true"
         else:
-            try:
-                params[key] = int(value)
-            except ValueError:
+            for convert in (int, float, str):
                 try:
-                    params[key] = float(value)
+                    params[key] = convert(value)
+                    break
                 except ValueError:
-                    params[key] = value
+                    continue
     return name.strip(), params
 
 
-def slug(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+async def kubectl(args: argparse.Namespace, *command: str) -> str:
+    process = await asyncio.create_subprocess_exec(args.kubectl, "-n", args.namespace, *command,
+                                                   stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, err = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(f"kubectl {' '.join(command)} failed: {err.decode().strip()}")
+    return out.decode().strip()
 
 
-class Kubectl:
-    def __init__(self, namespace: str, statefulset: str) -> None:
-        binary = shutil.which("kubectl")
-        if binary is None:
-            raise SystemExit("kubectl not found on PATH")
-        self._binary, self._namespace, self._statefulset = binary, namespace, statefulset
-
-    async def _run(self, *args: str) -> str:
-        process = await asyncio.create_subprocess_exec(
-            self._binary, "-n", self._namespace, *args,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        out, err = await process.communicate()
-        if process.returncode != 0:
-            raise RuntimeError(f"kubectl {' '.join(args)} failed: {err.decode().strip()}")
-        return out.decode().strip()
-
-    async def scale(self, replicas: int) -> None:
-        await self._run("scale", f"statefulset/{self._statefulset}", f"--replicas={replicas}")
-
-    async def ready(self) -> tuple[int, int]:
-        """Return (desired replicas, ready replicas)."""
-        out = await self._run("get", f"statefulset/{self._statefulset}",
-                              "-o", "jsonpath={.spec.replicas} {.status.readyReplicas}")
-        parts = out.split()
-        return int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+async def router_replica_count(admin: httpx.AsyncClient) -> int:
+    response = await admin.get("/admin/state")
+    response.raise_for_status()
+    return len(response.json()["replicas"])
 
 
-class Router:
-    def __init__(self, url: str) -> None:
-        self._client = httpx.AsyncClient(base_url=url.rstrip("/"), timeout=10.0)
-
-    async def check(self) -> None:
-        try:
-            (await self._client.get("/healthz")).raise_for_status()
-        except httpx.HTTPError as exc:
-            raise SystemExit(f"router not reachable ({exc}). Is `kubectl port-forward svc/router 8000:80` running?")
-
-    async def state(self) -> dict[str, Any]:
-        response = await self._client.get("/admin/state")
-        response.raise_for_status()
-        return response.json()
-
-    async def set_policy(self, name: str, params: dict[str, Any]) -> None:
-        response = await self._client.put("/admin/policy", json={"policy": name, "params": params})
-        if response.status_code != 200:
-            raise SystemExit(f"router rejected policy {name} {params}: {response.text}")
-
-    async def aclose(self) -> None:
-        await self._client.aclose()
-
-
-async def wait_for_replicas(kubectl: Kubectl, router: Router, count: int, timeout_s: float = 900) -> None:
-    """Wait until Kubernetes has exactly ``count`` ready replicas and the router sees them."""
-    deadline = time.monotonic() + timeout_s
+async def reset_to(args: argparse.Namespace, admin: httpx.AsyncClient, count: int) -> None:
+    """Scale to ``count`` and wait until Kubernetes has them all ready AND the router sees them."""
+    await kubectl(args, "scale", f"statefulset/{args.statefulset}", f"--replicas={count}")
+    deadline = time.monotonic() + EXP["replica_wait_timeout_s"]
     while True:
-        desired, ready = await kubectl.ready()
-        seen = len((await router.state())["replicas"])
+        parts = (await kubectl(args, "get", f"statefulset/{args.statefulset}", "-o",
+                               "jsonpath={.spec.replicas} {.status.readyReplicas}")).split()
+        desired, ready = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+        seen = await router_replica_count(admin)
         if desired == ready == seen == count:
             return
         if time.monotonic() > deadline:
             raise TimeoutError(f"expected {count} replicas; k8s desired={desired} ready={ready}, router sees {seen}")
-        await asyncio.sleep(2)
+        await asyncio.sleep(EXP["replica_poll_s"])
 
 
-async def reset_to(kubectl: Kubectl, router: Router, count: int) -> None:
-    await kubectl.scale(count)
-    await wait_for_replicas(kubectl, router, count)
-
-
-async def scale_up_during_run(kubectl: Kubectl, router: Router, t0: float, at_s: float, to: int) -> dict[str, float]:
+async def scale_up_during_run(args: argparse.Namespace, admin: httpx.AsyncClient, t0: float) -> dict[str, float]:
     loop = asyncio.get_running_loop()
-    await asyncio.sleep(max(0.0, t0 + at_s - loop.time()))
+    await asyncio.sleep(max(0.0, t0 + args.scale_at - loop.time()))
     command_s = loop.time() - t0
-    await kubectl.scale(to)
-    while len((await router.state())["replicas"]) < to:
-        await asyncio.sleep(1)
+    await kubectl(args, "scale", f"statefulset/{args.statefulset}", f"--replicas={args.scale_to}")
+    while await router_replica_count(admin) < args.scale_to:
+        await asyncio.sleep(EXP["scale_poll_s"])
     return {"scale_command_s": round(command_s, 3), "new_replica_ready_s": round(loop.time() - t0, 3)}
 
 
-async def run_one(args: argparse.Namespace, profile: Profile, kubectl: Kubectl, router: Router,
-                  spec: str, repeat: int, out_dir: Path) -> None:
+async def run_one(args: argparse.Namespace, profile: Profile, admin: httpx.AsyncClient, spec: str, repeat: int) -> None:
     name, params = parse_policy_spec(spec)
-    await reset_to(kubectl, router, args.base_replicas)
-    await router.set_policy(name, params)  # also resets the policy's in-memory state
+    await reset_to(args, admin, args.base_replicas)
+    response = await admin.put("/admin/policy", json={"policy": name, "params": params})  # also resets its state
+    if response.status_code != 200:
+        raise SystemExit(f"router rejected policy {name} {params}: {response.text}")
 
-    run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{slug(spec)}-r{repeat}"
+    run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{re.sub(r'[^a-z0-9]+', '-', spec.lower()).strip('-')}-r{repeat}"
     loop = asyncio.get_running_loop()
     t0 = loop.time()
     meta: dict[str, Any] = {
-        "run_id": run_id, "policy": spec, "policy_name": name, "policy_params": params,
-        "repeat": repeat, "seed": args.seed, "profile": args.profile,
-        "base_replicas": args.base_replicas, "scale_to": args.scale_to,
+        "run_id": run_id, "policy": spec, "policy_name": name, "policy_params": params, "repeat": repeat,
+        "seed": args.seed, "profile": args.profile, "base_replicas": args.base_replicas, "scale_to": args.scale_to,
         "scale_at_s": args.scale_at, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
-    scale_task = None
-    if args.scale_at > 0:
-        scale_task = asyncio.create_task(scale_up_during_run(kubectl, router, t0, args.scale_at, args.scale_to))
-
+    scale = asyncio.create_task(scale_up_during_run(args, admin, t0)) if args.scale_at > 0 else None
     print(f"[{run_id}] running policy {spec} ...", flush=True)
     rows = await run_traffic(router_url=args.router_url, profile=profile, run_id=run_id, policy=spec,
-                             out_csv=out_dir / f"{run_id}.csv", seed=args.seed, t0=t0,
-                             conversation_prefix=f"s{args.seed}")
+                             out_csv=Path(args.out_dir) / f"{run_id}.csv", seed=args.seed, t0=t0,
+                             conversation_prefix=f"s{args.seed}")  # same IDs, so same ring positions, for every policy
     meta["duration_s"] = round(loop.time() - t0, 3)
-
-    if scale_task is not None:
-        if scale_task.done():
-            meta.update(scale_task.result())
+    if scale is not None:
+        if scale.done():
+            meta.update(scale.result())
         else:
-            scale_task.cancel()
+            scale.cancel()
             meta["scale_skipped"] = "traffic finished before the scale-up; lower --scale-at"
             print(f"[{run_id}] WARNING: {meta['scale_skipped']}", flush=True)
-
     meta["requests"] = len(rows)
-    meta["errors"] = sum(1 for r in rows if r.get("status") != 200)
-    meta["router_state_at_end"] = await router.state()
-    (out_dir / f"{run_id}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    meta["errors"] = sum(r.get("status") != 200 for r in rows)
+    meta["router_state_at_end"] = (await admin.get("/admin/state")).json()
+    (Path(args.out_dir) / f"{run_id}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"[{run_id}] done: {meta['requests']} requests, {meta['errors']} errors", flush=True)
 
 
@@ -174,47 +134,46 @@ async def main_async(args: argparse.Namespace) -> None:
     profile = Profile.load(args.profile)
     for spec in args.policies:
         parse_policy_spec(spec)  # fail fast on typos
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    kubectl = Kubectl(args.namespace, args.statefulset)
-    router = Router(args.router_url)
-    try:
-        await router.check()
-        if args.prepare:
-            # The first time llm-3 starts, it downloads the model; later starts reuse its
-            # volume. Warming it once makes every run's scale-up cost the same.
-            print("preparing: warming the extra replica's volume ...", flush=True)
-            await reset_to(kubectl, router, args.scale_to)
-            await reset_to(kubectl, router, args.base_replicas)
-        for spec in args.policies:
-            for repeat in range(args.repeats):
-                await run_one(args, profile, kubectl, router, spec, repeat, out_dir)
-                await asyncio.sleep(args.cooldown_s)
-    finally:
+    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    async with httpx.AsyncClient(base_url=args.router_url.rstrip("/"), timeout=EXP["admin_timeout_s"]) as admin:
         try:
-            await kubectl.scale(args.base_replicas)
+            (await admin.get("/healthz")).raise_for_status()
+        except httpx.HTTPError as exc:
+            raise SystemExit(f"router not reachable ({exc}). Is `kubectl port-forward svc/router 8000:80` running?")
+        try:
+            if args.prepare:
+                # llm-3's first start downloads the model; later starts reuse its volume.
+                # Warming it once makes every run's scale-up cost the same.
+                print("preparing: warming the extra replica's volume ...", flush=True)
+                await reset_to(args, admin, args.scale_to)
+                await reset_to(args, admin, args.base_replicas)
+            for spec in args.policies:
+                for repeat in range(args.repeats):
+                    await run_one(args, profile, admin, spec, repeat)
+                    await asyncio.sleep(args.cooldown_s)
         finally:
-            await router.aclose()
+            await kubectl(args, "scale", f"statefulset/{args.statefulset}", f"--replicas={args.base_replicas}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--router-url", default="http://localhost:8000")
-    parser.add_argument("--profile", default="traffic/profiles/standard.json")
-    parser.add_argument("--policies", nargs="+", default=DEFAULT_POLICIES)
-    parser.add_argument("--repeats", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--scale-at", type=float, default=90.0, help="seconds after start; 0 disables")
-    parser.add_argument("--base-replicas", type=int, default=3)
-    parser.add_argument("--scale-to", type=int, default=4)
-    parser.add_argument("--cooldown-s", type=float, default=10.0)
-    parser.add_argument("--namespace", default="llm-ring")
-    parser.add_argument("--statefulset", default="llm")
-    parser.add_argument("--out-dir", default="experiments/results/raw")
+    parser.add_argument("--router-url", default=SETTINGS["router_url"])
+    parser.add_argument("--profile", default=EXP["profile"])
+    parser.add_argument("--policies", nargs="+", default=EXP["policies"])
+    parser.add_argument("--repeats", type=int, default=EXP["repeats"])
+    parser.add_argument("--seed", type=int, default=SETTINGS["seed"])
+    parser.add_argument("--scale-at", type=float, default=EXP["scale_at_s"], help="seconds after start; 0 disables")
+    parser.add_argument("--base-replicas", type=int, default=EXP["base_replicas"])
+    parser.add_argument("--scale-to", type=int, default=EXP["scale_to"])
+    parser.add_argument("--cooldown-s", type=float, default=EXP["cooldown_s"])
+    parser.add_argument("--namespace", default=EXP["namespace"])
+    parser.add_argument("--statefulset", default=EXP["statefulset"])
+    parser.add_argument("--out-dir", default=EXP["out_dir"])
     parser.add_argument("--prepare", action="store_true", help="warm the extra replica's volume first")
     args = parser.parse_args()
-    if args.scale_to <= args.base_replicas and args.scale_at > 0:
+    if args.scale_at > 0 and args.scale_to <= args.base_replicas:
         parser.error("--scale-to must be greater than --base-replicas")
+    args.kubectl = shutil.which("kubectl") or parser.error("kubectl not found on PATH")
     try:
         asyncio.run(main_async(args))
     except KeyboardInterrupt:
