@@ -3,6 +3,10 @@ apiVersion: kind.x-k8s.io/v1alpha4
 name: llm-ring
 nodes:
   - role: control-plane
+    extraPortMappings:
+     - containerPort: 30080
+       hostPort: 8000
+       listenAddress: "127.0.0.1"
   - role: worker
     labels: { pool: llm }
   - role: worker
