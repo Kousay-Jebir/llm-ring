@@ -11,7 +11,7 @@ data:
   ROUTER_POLICY: "consistent"
   ROUTER_VNODES: "100"                    # points per replica on the hash ring
   ROUTER_EPSILON: "0.25"                  # bounded loads: cap = (1 + epsilon) x average load
-  ROUTER_LOAD_METRIC: "requests"          # bounded: "requests" or "tokens"
+  ROUTER_LOAD_METRIC: "tokens"          # bounded: "requests" or "tokens"
   ROUTER_DEFAULT_MAX_TOKENS: "256"        # answer size assumed when a request doesn't set max_tokens
 
   # llm-aware additions (each switchable for ablations)

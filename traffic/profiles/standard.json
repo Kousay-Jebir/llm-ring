@@ -1,15 +1,15 @@
 {
   "description": "Main experiment: multi-turn chat, a quarter of users paste long documents.",
-  "conversations": 24,
-  "heavy_fraction": 0.25,
-  "turns_min": 5,
-  "turns_max": 8,
-  "arrival_window_s": 60,
+  "conversations": 50,
+  "heavy_fraction": 0.3,
+  "turns_min": 10,
+  "turns_max": 20,
+  "arrival_window_s": 12,
   "think_time_mean_s": 6,
   "think_time_max_s": 20,
-  "heavy_document_words": 450,
+  "heavy_document_words": 1000,
   "system_prompt_words": 120,
-  "max_tokens": 48,
-  "max_context_tokens": 3500,
-  "request_timeout_s": 600
+  "max_tokens": 120,
+  "max_context_tokens": 4000,
+  "request_timeout_s": 1200
 }
