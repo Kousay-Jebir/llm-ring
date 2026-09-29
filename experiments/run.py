@@ -166,4 +166,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()Remove-Item experiments/results/work_per_replica.png -ErrorAction SilentlyContinue
+    main()

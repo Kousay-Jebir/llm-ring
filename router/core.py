@@ -188,6 +188,8 @@ class RouterCore:
             record |= {k: timings.get(k) for k in TIMINGS}
         if error:
             record["error"] = error
+        if decision.trace:
+            record["trace"] = list(decision.trace)
         logger.info(json.dumps(record))
 
         headers = {REPLICA_HEADER: decision.replica, REASON_HEADER: decision.reason,
